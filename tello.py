@@ -4,6 +4,7 @@ import time
 from threading import Thread
 import signal
 import sys
+import cli_ui
 
 tello_ip = "192.168.10.1"
 tello_video = (tello_ip, 11111)
@@ -47,10 +48,53 @@ class TelloState:
         self.data = {}
         self.thread = None
 
+    def pitch(self):
+        return self.__int_value("pitch")
+    
+    def roll(self):
+        return self.__int_value("roll")
+    
+    def yaw(self):
+        return self.__int_value("yaw")
+    
+    def velocity_x(self):
+        return self.__int_value("vgx")
+    
+    def velocity_y(self):
+        return self.__int_value("vgy")
+    
+    def velocity_z(self):
+        return self.__int_value("vgz")
+
+    def temp_low(self):
+        return self.__int_value("templ")
+    
+    def temp_high(self):
+        return self.__int_value("temph")
+
+    def tof(self):
+        return self.__int_value("tof")
+    
+    def height(self):
+        return self.__int_value("h")
+
     def battery(self):
-        if "bat" not in self.data:
-            return -1
-        return int(self.data["bat"])
+        return self.__int_value("bat")
+    
+    def barometer(self):
+        return self.__float_value("baro")
+
+    def time(self):
+        return self.__int_value("time")
+    
+    def acceleration_x(self):
+        return self.__float_value("agx")
+    
+    def acceleration_y(self):
+        return self.__float_value("agy")
+    
+    def acceleration_z(self):
+        return self.__float_value("agz")
 
     def close(self):
         self.running = False
@@ -75,6 +119,16 @@ class TelloState:
                     if len(parts) == 2:
                         self.data[parts[0]] = parts[1]
 
+    def __int_value(self, key):
+        if key not in self.data:
+            return None
+        return int(self.data[key])
+
+    def __float_value(self, key):
+        if key not in self.data:
+            return None
+        return float(self.data[key])
+
 
 tello_cmd = TelloCommand()
 tello_cmd.connect()
@@ -92,14 +146,8 @@ def update_tello_state_display():
 tello_state_thread = Thread(target = update_tello_state_display)
 tello_state_thread.start()
 
-def signal_handler(sig, frame):
-    global still_running
-    still_running = False
+ui = TelloCliUi(tello_state)
+ui.take_control()
 
-    print("Shutting down...")
-    tello_state_thread.join()
-    tello_state.close()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.pause()
+tello_state_thread.join()
+tello_state.close()
