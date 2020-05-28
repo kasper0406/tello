@@ -1,6 +1,7 @@
 import curses
 from threading import Thread
 import time
+import string
 
 class TelloCliUi:
     def __init__(self, tello_state, refresh_rate = 0.5):

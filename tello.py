@@ -4,7 +4,9 @@ import time
 from threading import Thread
 import signal
 import sys
-import cli_ui
+import logging
+from cli_ui import TelloCliUi
+from ps4_controller import PS4Controller
 
 tello_ip = "192.168.10.1"
 tello_video = (tello_ip, 11111)
@@ -26,6 +28,36 @@ class TelloCommand:
         if self.__cmd_with_ack("command") != "ok":
             raise RuntimeError("Failed to command Tello :-(")
     
+    def takeoff(self):
+        return self.__cmd_with_ack("takeoff") == "ok"
+    
+    def land(self):
+        return self.__cmd_with_ack("land") == "ok"
+
+    def up(self, x):
+        return self.command_with_value("up", x)
+    
+    def down(self, x):
+        return self.command_with_value("down", x)
+    
+    def left(self, x):
+        return self.command_with_value("left", x)
+    
+    def right(self, x):
+        return self.command_with_value("right", x)
+    
+    def forward(self, x):
+        return self.command_with_value("forward", x)
+    
+    def backward(self, x):
+        return self.command_with_value("back", x)
+    
+    def clockwise(self, x):
+        return self.command_with_value("cw", x)
+    
+    def counter_clockwise(self, x):
+        return self.command_with_value("ccw", x)
+
     def get_battery(self):
         return self.__cmd_with_ack("battery?")
 
@@ -36,10 +68,19 @@ class TelloCommand:
             ready = select.select([self.sock], [], [], self.timeout)
             if ready[0]:
                 data, addr = self.sock.recvfrom(4096)
-                print(data)
-                print(addr)
                 return data.decode("utf-8")
         return False
+    
+    def command_with_value(self, cmd, x):
+        return self.__check_ok(cmd, self.__cmd_with_ack("{} {}".format(cmd, x)))
+
+    @staticmethod
+    def __check_ok(cmd, val):
+        if val == "ok":
+            return True
+        else:
+            logging.error("Failed {} command: {}".format(cmd, val))
+            return False
 
 class TelloState:
     def __init__(self, ip = "0.0.0.0", port = 8890):
@@ -121,33 +162,30 @@ class TelloState:
 
     def __int_value(self, key):
         if key not in self.data:
-            return None
+            # FIXME(knielsen): Hax, should be None, but is a "-" due to formatter in CLI
+            return "-"
         return int(self.data[key])
 
     def __float_value(self, key):
         if key not in self.data:
-            return None
+            # FIXME(knielsen): Hax, should be None, but is a "-" due to formatter in CLI
+            return "-"
         return float(self.data[key])
 
+if __name__ == "__main__":
+    logging.basicConfig(filename='tello.log', level=logging.DEBUG)
 
-tello_cmd = TelloCommand()
-tello_cmd.connect()
+    tello_cmd = TelloCommand()
+    tello_state = TelloState()
+    controller = PS4Controller(0, tello_cmd)
 
-tello_state = TelloState()
-tello_state.listen()
+    try:
+        tello_cmd.connect()
+        tello_state.listen()
+        controller.listen()
 
-still_running = True
-def update_tello_state_display():
-    while still_running:
-        print("Battery: {}%".format(tello_state.battery()))
-        time.sleep(1)
-
-
-tello_state_thread = Thread(target = update_tello_state_display)
-tello_state_thread.start()
-
-ui = TelloCliUi(tello_state)
-ui.take_control()
-
-tello_state_thread.join()
-tello_state.close()
+        ui = TelloCliUi(tello_state)
+        ui.take_control()
+    finally:
+        controller.stop()
+        tello_state.close()

@@ -1,55 +1,183 @@
-import pygame
 from threading import Thread
 import signal
 import sys
+import evdev
+import logging
+import select
+import time
+
+class ControllerState:
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.analog_left_x = 127
+        self.analog_left_y = 127
+        self.analog_right_x = 127
+        self.analog_right_y = 127
+
+        self.cross_pressed = False
+        self.circle_pressed = False
+
+class CommandState:
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.is_flying = False
 
 class PS4Controller:
     def __init__(self, jid, tello_cmd):
-        pygame.init()
         self.jid = jid
-        self.js = pygame.joystick.Joystick(jid)
-        self.js.init()
+        self.js = evdev.InputDevice(PS4Controller.get_controller_path(jid))
         self.tello_cmd = tello_cmd
 
-        self.thread = None
+        self.controller_state = ControllerState()
+        self.command_state = CommandState()
+
+        self.listener = None
+        self.commander = None
         self.running = False
     
     def listen(self):
-        print("Starting listening to PS4 controller")
+        logging.info("Starting listening to PS4 controller {}".format(self.js.path))
         self.running = True
-        self.thread = Thread(target = self.__listen)
-        self.thread.start()
+        self.listener = Thread(target = self.__listen)
+        self.listener.start()
+
+        self.commander = Thread(target = self.__command)
+        self.commander.start()
 
     def stop(self):
         self.running = False
-        self.thread.join()
-        self.js.quit()
-        pygame.quit()
+
+        self.commander.join()
+
+        self.listener.join()
+        self.js.close()
 
     def __listen(self):
         while self.running:
-            event = pygame.event.wait()
-            if not hasattr(event, "joy") or event.joy != self.jid:
-                continue
+            _r, _w, _x = select.select([self.js], [], [])
+            for event in self.js.read():
+                
+                if event.type == evdev.ecodes.EV_ABS:
+                    # Analog controller event
+                    if event.code == evdev.ecodes.ABS_X:
+                        self.controller_state.analog_left_x = event.value
+                    elif event.code == evdev.ecodes.ABS_Y:
+                        self.controller_state.analog_left_y = event.value
+                    
+                    elif event.code == evdev.ecodes.ABS_RX:
+                        self.controller_state.analog_right_x = event.value
+                    elif event.code == evdev.ecodes.ABS_RY:
+                        self.controller_state.analog_right_y = event.value
+                elif event.type == evdev.ecodes.EV_KEY:
+                    if event.code == evdev.ecodes.BTN_A:
+                        self.controller_state.cross_pressed = event.value
+                    
+                    if event.code == evdev.ecodes.BTN_B:
+                        self.controller_state.circle_pressed = event.value
 
-            if event.type == pygame.JOYBUTTONDOWN:
-                if event.button == 1:
-                    self.tello_cmd.takeoff()
-                elif event.button == 2:
-                    self.tello_cmd.land()
-            elif event.type == pygame.JOYHATMOTION:
-                print("JOYHATMOTION: {}".format(event))
-            elif event.type == pygame.JOYBALLMOTION:
-                print("JOYBALLMOTION: {}".format(event))
+    def __command(self):
+        LOW_THRESH = 20
+        HIGH_THRESH = 235
+
+        while self.running:
+            if not (self.controller_state.cross_pressed and self.controller_state.circle_pressed):
+                if self.controller_state.cross_pressed and not self.command_state.is_flying:
+                    if self.tello_cmd.takeoff():
+                        self.command_state.is_flying = True
+                elif self.controller_state.circle_pressed and self.command_state.is_flying:
+                    if self.tello_cmd.land():
+                        self.command_state.is_flying = False
+
+            if self.command_state.is_flying:
+
+                # Give flying instructions
+                if self.controller_state.analog_left_x < LOW_THRESH:
+                    self.tello_cmd.left(20)
+                elif self.controller_state.analog_left_x > HIGH_THRESH:
+                    self.tello_cmd.right(20)
+
+                if self.controller_state.analog_left_y < LOW_THRESH:
+                    self.tello_cmd.forward(20)
+                elif self.controller_state.analog_left_y > HIGH_THRESH:
+                    self.tello_cmd.backward(20)
+
+                if self.controller_state.analog_right_x < LOW_THRESH:
+                    self.tello_cmd.counter_clockwise(1)
+                elif self.controller_state.analog_right_x > HIGH_THRESH:
+                    self.tello_cmd.clockwise(1)
+
+                if self.controller_state.analog_right_y < LOW_THRESH:
+                    self.tello_cmd.up(20)
+                elif self.controller_state.analog_right_y > HIGH_THRESH:
+                    self.tello_cmd.down(20)
+
+            time.sleep(0.1)
+
+    @staticmethod
+    def get_controller_path(idx):
+        i = 0
+        for path in evdev.list_devices():
+            logging.debug("Checking controller path {}".format(path))
+            device = evdev.InputDevice(path)
+            try:
+                logging.debug("Found name {} for controler path {}".format(device.name, path))
+                if device.name == "Wireless Controller":
+                    if i == idx:
+                        return device.path
+                    i += 1
+            finally:
+                device.close()
+
+        raise RuntimeError("Did not find a wireless controller!")
 
 
 if __name__ == "__main__":
+    import pprint
+    pp = pprint.PrettyPrinter(indent=4)
+
+    logging.basicConfig(level=logging.DEBUG)
+
+    path = PS4Controller.get_controller_path(0)
+    dev = evdev.InputDevice(path)
+
+    pp.pprint(dev.capabilities(verbose=True))
+
     class MockTelloCmd:
         def takeoff(self):
             print("Takeoff! Wrooommm")
+            return True
         
         def land(self):
             print("Landing!")
+            return True
+        
+        def left(self, x):
+            print("Left!")
+        
+        def right(self, x):
+            print("Right!")
+        
+        def forward(self, x):
+            print("Forward!")
+        
+        def backward(self, x):
+            print("Backward!")
+        
+        def up(self, x):
+            print("Up!")
+
+        def down(self, x):
+            print("Down!")
+
+        def clockwise(self, x):
+            print("Clockwise!")
+        
+        def counter_clockwise(self, x):
+            print("Counter Clockwise!")
 
     mock_tello_cmd = MockTelloCmd()
     controller = PS4Controller(0, mock_tello_cmd)
