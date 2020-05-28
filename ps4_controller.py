@@ -80,8 +80,7 @@ class PS4Controller:
                         self.controller_state.circle_pressed = event.value
 
     def __command(self):
-        LOW_THRESH = 20
-        HIGH_THRESH = 235
+        THRES = 10
 
         while self.running:
             if not (self.controller_state.cross_pressed and self.controller_state.circle_pressed):
@@ -93,27 +92,13 @@ class PS4Controller:
                         self.command_state.is_flying = False
 
             if self.command_state.is_flying:
+                x = int((self.controller_state.analog_left_x - 127) / 1.28)
+                y = int((self.controller_state.analog_left_y - 127) / 1.28)
+                z = int((self.controller_state.analog_right_y - 127) / 1.28)
+                yaw = int((self.controller_state.analog_right_x - 127) / 1.28)
 
-                # Give flying instructions
-                if self.controller_state.analog_left_x < LOW_THRESH:
-                    self.tello_cmd.left(20)
-                elif self.controller_state.analog_left_x > HIGH_THRESH:
-                    self.tello_cmd.right(20)
-
-                if self.controller_state.analog_left_y < LOW_THRESH:
-                    self.tello_cmd.forward(20)
-                elif self.controller_state.analog_left_y > HIGH_THRESH:
-                    self.tello_cmd.backward(20)
-
-                if self.controller_state.analog_right_x < LOW_THRESH:
-                    self.tello_cmd.counter_clockwise(1)
-                elif self.controller_state.analog_right_x > HIGH_THRESH:
-                    self.tello_cmd.clockwise(1)
-
-                if self.controller_state.analog_right_y < LOW_THRESH:
-                    self.tello_cmd.up(20)
-                elif self.controller_state.analog_right_y > HIGH_THRESH:
-                    self.tello_cmd.down(20)
+                if abs(x) > THRES or abs(y) > THRES or abs(z) > THRES or abs(yaw) > THRES:
+                    self.tello_cmd.remote_control(x, y, z, yaw)
 
             time.sleep(0.1)
 
@@ -178,6 +163,9 @@ if __name__ == "__main__":
         
         def counter_clockwise(self, x):
             print("Counter Clockwise!")
+        
+        def remote_control(self, x, y, z, yaw):
+            print("RC {} {} {} {}".format(x, y, z, yaw))
 
     mock_tello_cmd = MockTelloCmd()
     controller = PS4Controller(0, mock_tello_cmd)

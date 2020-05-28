@@ -14,7 +14,7 @@ tello_video = (tello_ip, 11111)
 class TelloCommand:
     # timeout in seconds for a command
     # num_retries number of times to retry command
-    def __init__(self, ip = "192.168.10.1", port = 8889, timeout = 0.5, num_retries = 5):
+    def __init__(self, ip = "192.168.10.1", port = 8889, timeout = 15, num_retries = 5):
         self.timeout = timeout
         self.num_retries = num_retries
         self.tello_cmd = (ip, port)
@@ -29,9 +29,11 @@ class TelloCommand:
             raise RuntimeError("Failed to command Tello :-(")
     
     def takeoff(self):
+        logging.info("Takeoff called!")
         return self.__cmd_with_ack("takeoff") == "ok"
     
     def land(self):
+        logging.info("Land called!")
         return self.__cmd_with_ack("land") == "ok"
 
     def up(self, x):
@@ -57,17 +59,23 @@ class TelloCommand:
     
     def counter_clockwise(self, x):
         return self.command_with_value("ccw", x)
+    
+    def remote_control(self, x, y, z, yaw):
+        logging.info("Sending rc command")
+        return self.command_with_value("rc", "{} {} {} {}".format(x, y, z, yaw))
 
     def get_battery(self):
         return self.__cmd_with_ack("battery?")
 
     # Send a command to Tello, and retry if it fails
     def __cmd_with_ack(self, command):
-        for _i in range(self.num_retries):
+        for i in range(self.num_retries):
+            logging.info("Sending command '{}' to tello trial {}".format(command, i + 1))
             self.sock.sendto(command.encode("utf-8"), self.tello_cmd)
             ready = select.select([self.sock], [], [], self.timeout)
             if ready[0]:
                 data, addr = self.sock.recvfrom(4096)
+                logging.info("Received '{}' from {}".format(data, addr))
                 return data.decode("utf-8")
         return False
     
@@ -79,7 +87,7 @@ class TelloCommand:
         if val == "ok":
             return True
         else:
-            logging.error("Failed {} command: {}".format(cmd, val))
+            logging.error("Failed '{}' command: {}".format(cmd, val))
             return False
 
 class TelloState:
