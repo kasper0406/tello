@@ -19,12 +19,16 @@ class ControllerState:
         self.cross_pressed = False
         self.circle_pressed = False
 
+        self.hat_x = 0
+        self.hat_y = 0
+
 class CommandState:
     def __init__(self):
         self.reset()
     
     def reset(self):
         self.is_flying = False
+        self.last_flip = time.time()
 
 class PS4Controller:
     def __init__(self, jid, tello_cmd):
@@ -38,6 +42,8 @@ class PS4Controller:
         self.listener = None
         self.commander = None
         self.running = False
+
+        self.flip_timeout = 1
     
     def listen(self):
         logging.info("Starting listening to PS4 controller {}".format(self.js.path))
@@ -72,35 +78,54 @@ class PS4Controller:
                         self.controller_state.analog_right_x = event.value
                     elif event.code == evdev.ecodes.ABS_RY:
                         self.controller_state.analog_right_y = event.value
+                    
+                    elif event.code == evdev.ecodes.ABS_HAT0X:
+                        self.controller_state.hat_x = event.value
+                    elif event.code == evdev.ecodes.ABS_HAT0Y:
+                        self.controller_state.hat_y = event.value
+                        
                 elif event.type == evdev.ecodes.EV_KEY:
                     if event.code == evdev.ecodes.BTN_A:
                         self.controller_state.cross_pressed = event.value
-                    
-                    if event.code == evdev.ecodes.BTN_B:
+                    elif event.code == evdev.ecodes.BTN_B:
                         self.controller_state.circle_pressed = event.value
+                elif event.type == evdev.ecodes.SYN_REPORT:
+                    pass
+                    
 
     def __command(self):
-        THRES = 10
-
         while self.running:
             if not (self.controller_state.cross_pressed and self.controller_state.circle_pressed):
                 if self.controller_state.cross_pressed and not self.command_state.is_flying:
-                    if self.tello_cmd.takeoff():
-                        self.command_state.is_flying = True
+                    self.tello_cmd.takeoff()
+                    self.command_state.is_flying = True
                 elif self.controller_state.circle_pressed and self.command_state.is_flying:
-                    if self.tello_cmd.land():
-                        self.command_state.is_flying = False
+                    self.tello_cmd.land()
+                    self.command_state.is_flying = False
 
             if self.command_state.is_flying:
+                if self.controller_state.hat_x == 1:
+                    self.__internal_flip("3")
+                elif self.controller_state.hat_x == -1:
+                    self.__internal_flip("1")
+                elif self.controller_state.hat_y == 1:
+                    self.__internal_flip("2")
+                elif self.controller_state.hat_y == -1:
+                    self.__internal_flip("0")
+
                 x = int((self.controller_state.analog_left_x - 127) / 1.28)
-                y = int((self.controller_state.analog_left_y - 127) / 1.28)
-                z = int((self.controller_state.analog_right_y - 127) / 1.28)
+                y = -int((self.controller_state.analog_left_y - 127) / 1.28)
+                z = -int((self.controller_state.analog_right_y - 127) / 1.28)
                 yaw = int((self.controller_state.analog_right_x - 127) / 1.28)
+                self.tello_cmd.remote_control(x, y, z, yaw)
 
-                if abs(x) > THRES or abs(y) > THRES or abs(z) > THRES or abs(yaw) > THRES:
-                    self.tello_cmd.remote_control(x, y, z, yaw)
+            time.sleep(0.001)
 
-            time.sleep(0.1)
+    def __internal_flip(self, direction):
+        cur_time = time.time()
+        if self.command_state.last_flip + self.flip_timeout < cur_time:
+            self.tello_cmd.flip(direction)
+            self.command_state.last_flip = time.time()
 
     @staticmethod
     def get_controller_path(idx):
@@ -165,7 +190,11 @@ if __name__ == "__main__":
             print("Counter Clockwise!")
         
         def remote_control(self, x, y, z, yaw):
-            print("RC {} {} {} {}".format(x, y, z, yaw))
+            # print("RC {} {} {} {}".format(x, y, z, yaw))
+            pass
+        
+        def flip(self, direction):
+            print("flip {}".format(direction))
 
     mock_tello_cmd = MockTelloCmd()
     controller = PS4Controller(0, mock_tello_cmd)

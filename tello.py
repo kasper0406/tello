@@ -14,7 +14,7 @@ tello_video = (tello_ip, 11111)
 class TelloCommand:
     # timeout in seconds for a command
     # num_retries number of times to retry command
-    def __init__(self, ip = "192.168.10.1", port = 8889, timeout = 15, num_retries = 5):
+    def __init__(self, ip = "192.168.10.1", port = 8889, timeout = 5, num_retries = 1):
         self.timeout = timeout
         self.num_retries = num_retries
         self.tello_cmd = (ip, port)
@@ -25,16 +25,15 @@ class TelloCommand:
             raise RuntimeError("Command has already been connected!")
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if self.__cmd_with_ack("command") != "ok":
-            raise RuntimeError("Failed to command Tello :-(")
+        self.__cmd_and_forget("command")
     
     def takeoff(self):
         logging.info("Takeoff called!")
-        return self.__cmd_with_ack("takeoff") == "ok"
+        return self.__cmd_and_forget("takeoff") == "ok"
     
     def land(self):
         logging.info("Land called!")
-        return self.__cmd_with_ack("land") == "ok"
+        return self.__cmd_and_forget("land") == "ok"
 
     def up(self, x):
         return self.command_with_value("up", x)
@@ -59,28 +58,19 @@ class TelloCommand:
     
     def counter_clockwise(self, x):
         return self.command_with_value("ccw", x)
+
+    def flip(self, direction):
+        return self.command_with_value("flip", direction)
     
     def remote_control(self, x, y, z, yaw):
-        logging.info("Sending rc command")
-        return self.command_with_value("rc", "{} {} {} {}".format(x, y, z, yaw))
+        self.__cmd_and_forget("rc {} {} {} {}".format(x, y, z, yaw))
 
-    def get_battery(self):
-        return self.__cmd_with_ack("battery?")
+    def __cmd_and_forget(self, command):
+        logging.debug("Sending command '{}' to Tello with no ack".format(command))
+        self.sock.sendto(command.encode("utf-8"), self.tello_cmd)
 
-    # Send a command to Tello, and retry if it fails
-    def __cmd_with_ack(self, command):
-        for i in range(self.num_retries):
-            logging.info("Sending command '{}' to tello trial {}".format(command, i + 1))
-            self.sock.sendto(command.encode("utf-8"), self.tello_cmd)
-            ready = select.select([self.sock], [], [], self.timeout)
-            if ready[0]:
-                data, addr = self.sock.recvfrom(4096)
-                logging.info("Received '{}' from {}".format(data, addr))
-                return data.decode("utf-8")
-        return False
-    
     def command_with_value(self, cmd, x):
-        return self.__check_ok(cmd, self.__cmd_with_ack("{} {}".format(cmd, x)))
+        return self.__cmd_and_forget("{} {}".format(cmd, x))
 
     @staticmethod
     def __check_ok(cmd, val):
@@ -116,10 +106,10 @@ class TelloState:
         return self.__int_value("vgz")
 
     def temp_low(self):
-        return self.__int_value("templ")
+        return self.__to_celcius(self.__int_value("templ"))
     
     def temp_high(self):
-        return self.__int_value("temph")
+        return self.__to_celcius(self.__int_value("temph"))
 
     def tof(self):
         return self.__int_value("tof")
@@ -163,6 +153,7 @@ class TelloState:
             ready = select.select([self.sock], [], [], 0.5)
             if ready[0]:
                 data = self.sock.recv(4096).decode('utf-8')
+                logging.debug("State from tello: {}".format(data))
                 for var in data.split(";"):
                     parts = var.split(":")
                     if len(parts) == 2:
@@ -179,6 +170,14 @@ class TelloState:
             # FIXME(knielsen): Hax, should be None, but is a "-" due to formatter in CLI
             return "-"
         return float(self.data[key])
+    
+    @staticmethod
+    def __to_celcius(fahrenheit):
+        try:
+            return int((int(fahrenheit) - 32) * 5 / 9)
+        except ValueError:
+            # FIXME(knielsen): Hax, should be None, but is a "-" due to formatter in CLI
+            return "-"
 
 if __name__ == "__main__":
     logging.basicConfig(filename='tello.log', level=logging.DEBUG)

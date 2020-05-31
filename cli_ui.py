@@ -4,7 +4,7 @@ import time
 import string
 
 class TelloCliUi:
-    def __init__(self, tello_state, refresh_rate = 0.5):
+    def __init__(self, tello_state, refresh_rate = 0.2):
         self.tello_state = tello_state
         self.refresh_rate = refresh_rate
         self.running = False
