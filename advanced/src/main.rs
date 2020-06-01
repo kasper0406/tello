@@ -34,8 +34,8 @@ impl TelloGram {
         self.m_header
     }
 
-    fn size(&self) -> u16 {
-        self.m_size >> 3
+    fn size(&self) -> usize {
+        (self.m_size >> 3) as usize
     }
 
     fn crc8(&self) -> u8 {
@@ -66,9 +66,8 @@ impl TelloGram {
         self.m_sequence
     }
 
-    // Payload is returned in network byte order
     fn payload(&self) -> Vec<u8> {
-        let payload_size = (self.size() - 11) as usize;
+        let payload_size = self.size() - 11;
         unsafe {
             let gram_start = (self as *const TelloGram) as *const u8;
             slice::from_raw_parts(gram_start.offset(9), payload_size)
@@ -84,6 +83,19 @@ impl TelloGram {
             res |= *crc16_start as u16;
             res
         }
+    }
+
+    fn is_valid(&self) -> bool {
+        let header_slice = unsafe {
+            let gram_start = (self as *const TelloGram) as *const u8;
+            slice::from_raw_parts(gram_start, 3)
+        };
+        let payload_slice = unsafe {
+            let gram_start = (self as *const TelloGram) as *const u8;
+            slice::from_raw_parts(gram_start, self.size() - 2)
+        };
+        return crc::calculate_crc8(header_slice) == self.crc8()
+            && crc::calculate_crc16(payload_slice) == self.crc16();
     }
 }
 
@@ -145,6 +157,12 @@ fn main() {
                     } else {
                         // Interpret as TelloGram
                         let gram = unsafe { &*buffer.as_ptr().cast::<TelloGram>() };
+
+                        if !gram.is_valid() {
+                            println!("Received invalid TelloGram {:?}", &buffer[..num_bytes]);
+                            continue
+                        }
+
                         println!("Header: {:?}", gram.header());
                         println!("Size: {:?}", gram.size());
                         println!("CRC8: {:?}", gram.crc8());

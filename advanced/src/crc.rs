@@ -1,3 +1,4 @@
+
 const crc8_table: [u8; 256] = [
 	0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
 	0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e, 0x5f, 0x01, 0xe3, 0xbd, 0x3e, 0x60, 0x82, 0xdc,
@@ -18,7 +19,7 @@ const crc8_table: [u8; 256] = [
 ];
 
 const crc16_table: [u16; 256] = [
-    0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf, 0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,
+	0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf, 0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,
 	0x1081, 0x0108, 0x3393, 0x221a, 0x56a5, 0x472c, 0x75b7, 0x643e, 0x9cc9, 0x8d40, 0xbfdb, 0xae52, 0xdaed, 0xcb64, 0xf9ff, 0xe876,
 	0x2102, 0x308b, 0x0210, 0x1399, 0x6726, 0x76af, 0x4434, 0x55bd, 0xad4a, 0xbcc3, 0x8e58, 0x9fd1, 0xeb6e, 0xfae7, 0xc87c, 0xd9f5,
 	0x3183, 0x200a, 0x1291, 0x0318, 0x77a7, 0x662e, 0x54b5, 0x453c, 0xbdcb, 0xac42, 0x9ed9, 0x8f50, 0xfbef, 0xea66, 0xd8fd, 0xc974,
@@ -36,34 +37,34 @@ const crc16_table: [u16; 256] = [
 	0xf78f, 0xe606, 0xd49d, 0xc514, 0xb1ab, 0xa022, 0x92b9, 0x8330, 0x7bc7, 0x6a4e, 0x58d5, 0x495c, 0x3de3, 0x2c6a, 0x1ef1, 0x0f78,
 ];
 
-fn calculate_crc8(bytes: &[u8]) -> u8 {
-    let mut crc: u8 = 0x77;
-    for b in bytes {
-        crc = crc8_table[(crc ^ b) as usize];
-    }
-    crc
+pub fn calculate_crc8(bytes: &[u8]) -> u8 {
+	let mut crc: u8 = 0x77;
+	for b in bytes {
+		crc = crc8_table[(crc ^ b) as usize];
+	}
+	crc
 }
 
-fn calculate_crc16(bytes: &[u8]) -> u16 {
-    let mut crc: u16 = 0x3692;
-    for b in bytes {
-        crc = crc16_table[((crc as u8) ^ b) as usize] ^ (crc >> 8);
-    }
-    crc
+pub fn calculate_crc16(bytes: &[u8]) -> u16 {
+	let mut crc: u16 = 0x3692;
+	for b in bytes {
+		crc = crc16_table[((crc as u8) ^ b) as usize] ^ (crc >> 8);
+	}
+	crc
 }
 
 #[test]
 fn test_crc8() {
-    let sample_command = [204, 24, 1];
-    let crc8 = calculate_crc8(&sample_command);
-    println!("CRC8 = {}", crc8);
-    assert!(crc8 == 185);
+	let sample_command = [204, 24, 1];
+	let crc8 = calculate_crc8(&sample_command);
+	println!("CRC8 = {}", crc8);
+	assert!(crc8 == 185);
 }
 
 #[test]
 fn test_crc16() {
-    let sample_command = [204, 24, 1, 185, 136, 86, 0, 32, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 81, 0, 0, 252, 15, 0, 6, 0, 0, 0, 0, 0];
-    let crc16 = calculate_crc16(&sample_command);
-    println!("CRC16 = {}", crc16);
-    assert!(crc16 == 52802);
+	let sample_command = [204, 24, 1, 185, 136, 86, 0, 32, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 81, 0, 0, 252, 15, 0, 6, 0, 0, 0, 0, 0];
+	let crc16 = calculate_crc16(&sample_command);
+	println!("CRC16 = {}", crc16);
+	assert!(crc16 == 52802);
 }
