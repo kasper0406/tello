@@ -5,3 +5,9 @@ authors = ["Kasper Nielsen <kasper0406@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+gstreamer = "0.15.6"
+
+[dependencies.gstreamer-app]
+version = "0.15.6"
+default-features = false
+features = ["v1_10"]

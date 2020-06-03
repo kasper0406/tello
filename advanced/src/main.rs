@@ -1,4 +1,8 @@
 mod crc;
+extern crate gstreamer as gst;
+extern crate gstreamer_app as gst_app;
+
+use gst::prelude::*;
 
 use std::net::{ SocketAddr, UdpSocket };
 use std::convert::TryInto;
@@ -8,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{ AtomicBool, Ordering };
 use std::slice;
 use std::assert;
+use std::time::Duration;
 
 const TELLO_CMD_PORT: u16 = 8889;
 const LOCAL_CMD_PORT: u16 = 8800;
@@ -133,6 +138,8 @@ impl<'a> NetworkPackage for TelloConnectRequest<'a> {
 }
 
 fn main() {
+    gst::init().expect("Failed to init gstreamer");
+
     let is_running = Arc::new(AtomicBool::new(true));
 
     let cmd_bind_addr = SocketAddr::from(([0, 0, 0, 0], LOCAL_CMD_PORT));
@@ -140,8 +147,9 @@ fn main() {
     cmd_socket_write.connect(SocketAddr::from((TELLO_IP, TELLO_CMD_PORT))).expect("Failed to connect to Tello command");
 
     let cmd_socket_read = cmd_socket_write.try_clone().expect("Failed to clone socket");
+    cmd_socket_read.set_read_timeout(Some(Duration::from_secs(1))).expect("Failed to set cmd read timeout");
 
-    let video_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], VIDEO_PORT))).expect("Failed to create video socket");
+    // let video_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], VIDEO_PORT))).expect("Failed to create video socket");
 
     let cmd_listen_thread_running = is_running.clone();
     let cmd_listen_thread = thread::spawn(move || {
@@ -181,17 +189,36 @@ fn main() {
         }
     });
 
+    let pipeline = gst::Pipeline::new(None);
+    let udpsrc = gst::ElementFactory::make("udpsrc", None).expect("Failed to create udpsrc");
+    let sink = gst::ElementFactory::make("appsink", None).expect("Failed to create appsink");
+
+    pipeline.add_many(&[&udpsrc, &sink]).expect("Failed to create pipeline");
+    udpsrc.link(&sink).expect("Failed to link sink");
+
+    udpsrc.set_property("port", &(VIDEO_PORT as i32).to_value()).expect("Failed to set UDP port");
+
+    let appsink = sink.dynamic_cast::<gst_app::AppSink>().expect("Pipeline should be an appsink!");
+
+    pipeline.set_state(gst::State::Playing).expect("Failed to change pipeline state to play");
+    let bus = pipeline.get_bus().expect("Faield to get video bus");
+    
+
+    /*
+    bus.add_watch(|bus, message| {
+        println!("Messages received: {:?}", message);
+
+        Continue(true)
+    }).expect("Failed to add video watch");
+    */
+
+
     let video_listen_thread_running = is_running.clone();
     let video_listen_thread = thread::spawn(move || {
-        let mut buffer: [u8; 4096] = [0; 4096];
-        
         while (*video_listen_thread_running).load(Ordering::Relaxed) {
-            match video_socket.recv(&mut buffer) {
-                Ok(num_bytes) => {
-                    let video_bytes = &buffer[..num_bytes];
-                    // println!("Video package of {} bytes", num_bytes);
-                },
-                Err(e) => println!("receive failed: {:?}", e),
+            match appsink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
+                Some(sample) => println!("Received sample: {:?}", sample),
+                None => println!("No video package received")
             }
         }
     });
