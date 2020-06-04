@@ -35,6 +35,8 @@ enum TelloGramDirection {
 }
 
 impl TelloGram {
+    const GRAM_SIZE: usize = 11;
+
     fn header(&self) -> u8 {
         self.m_header
     }
@@ -72,7 +74,7 @@ impl TelloGram {
     }
 
     fn payload(&self) -> Vec<u8> {
-        let payload_size = self.size() - 11;
+        let payload_size = self.size() - TelloGram::GRAM_SIZE;
         unsafe {
             let gram_start = (self as *const TelloGram) as *const u8;
             slice::from_raw_parts(gram_start.offset(9), payload_size)
@@ -101,6 +103,32 @@ impl TelloGram {
         };
         return crc::calculate_crc8(header_slice) == self.crc8()
             && crc::calculate_crc16(payload_slice) == self.crc16();
+    }
+
+    fn construct_package(packet_type: u8, command: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+        let packet_size = TelloGram::GRAM_SIZE + payload.len();
+
+        let mut buffer = vec![0; packet_size];
+        let mut gram = unsafe { &mut *buffer.as_mut_ptr().cast::<TelloGram>() };
+        gram.m_header = 0xcc;
+        gram.m_size = (packet_size << 3) as u16;
+        gram.m_crc8 = crc::calculate_crc8(&buffer[..3]);
+        gram.m_discriminator |= 0x40;
+        gram.m_discriminator |= (packet_type << 3) & 0x38;
+        // gram.m_discriminator |= packet_subtype & 0x7;
+        gram.m_id = command;
+        gram.m_sequence = seq;
+
+        for i in 0..payload.len() {
+            buffer[i + 9] = payload[i];
+        }
+
+        let crc16 = crc::calculate_crc16(&buffer[..packet_size - 2]);
+        let crc16_buf: [u8; 2] = unsafe { std::mem::transmute(crc16.to_be()) };
+        buffer[packet_size - 2] = crc16_buf[1];
+        buffer[packet_size - 1] = crc16_buf[0];
+
+        buffer
     }
 }
 
@@ -158,7 +186,7 @@ fn main() {
         while (*cmd_listen_thread_running).load(Ordering::Relaxed) {
             match cmd_socket_read.recv(&mut buffer) {
                 Ok(num_bytes) => {
-                    println!("Command package of {} bytes: {:?}", num_bytes, &buffer[..num_bytes]);
+                    // println!("Command package of {} bytes: {:?}", num_bytes, &buffer[..num_bytes]);
 
                     if buffer.starts_with("conn_ack:".as_bytes()) {
                         println!("Connected to Tello!");
@@ -171,6 +199,7 @@ fn main() {
                             continue
                         }
 
+                        /*
                         println!("Header: {:?}", gram.header());
                         println!("Size: {:?}", gram.size());
                         println!("CRC8: {:?}", gram.crc8());
@@ -182,6 +211,7 @@ fn main() {
                         println!("CRC16: {:?}", gram.crc16());
                         println!("Payload: {:?}", gram.payload());
                         println!("");
+                        */
                     }
                 },
                 Err(e) => println!("receive failed: {:?}", e),
@@ -189,6 +219,7 @@ fn main() {
         }
     });
 
+    /*
     let pipeline = gst::Pipeline::new(None);
     let udpsrc = gst::ElementFactory::make("udpsrc", None).expect("Failed to create udpsrc");
     let sink = gst::ElementFactory::make("appsink", None).expect("Failed to create appsink");
@@ -202,35 +233,37 @@ fn main() {
 
     pipeline.set_state(gst::State::Playing).expect("Failed to change pipeline state to play");
     let bus = pipeline.get_bus().expect("Faield to get video bus");
-    
-
-    /*
-    bus.add_watch(|bus, message| {
-        println!("Messages received: {:?}", message);
-
-        Continue(true)
-    }).expect("Failed to add video watch");
-    */
-
 
     let video_listen_thread_running = is_running.clone();
     let video_listen_thread = thread::spawn(move || {
         while (*video_listen_thread_running).load(Ordering::Relaxed) {
             match appsink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
-                Some(sample) => println!("Received sample: {:?}", sample),
+                Some(sample) => {
+                    // sample..
+                    println!("Received sample: {:?}", sample)
+                },
                 None => println!("No video package received")
             }
         }
-    });
+    }); */
 
     let connect_request = TelloConnectRequest::connect(VIDEO_PORT);
 
     println!("Sending bytes to Tello {:?}", connect_request.as_bytes().as_slice());
     cmd_socket_write.send(connect_request.as_bytes().as_slice()).expect("Failed to send command to Tello");
 
-    thread::sleep(time::Duration::from_secs(1));
+    thread::sleep(time::Duration::from_millis(500));
+
+    let spspps_video_req = TelloGram::construct_package(4, 0x25, 0, &[]);
+    let gram = unsafe { &*spspps_video_req.as_ptr().cast::<TelloGram>() };
+    println!("Is video gram valid? {}", gram.is_valid());
+
+    println!("Send video package to Tello {:?}", spspps_video_req);
+    cmd_socket_write.send(&spspps_video_req).expect("Failed to send video request");
+
+    thread::sleep(time::Duration::from_secs(5));
     is_running.store(false, Ordering::Relaxed);
 
-    video_listen_thread.join().expect("Failed to join video thread");
+    // video_listen_thread.join().expect("Failed to join video thread");
     cmd_listen_thread.join().expect("Failed to join cmd thread");
 }
