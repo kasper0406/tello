@@ -30,6 +30,25 @@ struct TelloGram {
 }
 
 #[derive(Debug)]
+struct FlightData {
+    height: u16,
+    battery_percentage: u8,
+    camera_state: u8
+}
+
+impl FlightData {
+    fn from(bytes: &[u8]) -> FlightData {
+        assert!(bytes.len() == 24);
+
+        FlightData {
+            height: (bytes[0] as u16) | ((bytes[1] as u16) << 8),
+            battery_percentage: bytes[12],
+            camera_state: bytes[20]
+        }
+    }
+}
+
+#[derive(Debug)]
 enum TelloGramDirection {
     ToDrone, FromDrone, Unknown
 }
@@ -177,7 +196,7 @@ fn main() {
     let cmd_socket_read = cmd_socket_write.try_clone().expect("Failed to clone socket");
     cmd_socket_read.set_read_timeout(Some(Duration::from_secs(1))).expect("Failed to set cmd read timeout");
 
-    // let video_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], VIDEO_PORT))).expect("Failed to create video socket");
+    let video_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], VIDEO_PORT))).expect("Failed to create video socket");
 
     let cmd_listen_thread_running = is_running.clone();
     let cmd_listen_thread = thread::spawn(move || {
@@ -197,6 +216,19 @@ fn main() {
                         if !gram.is_valid() {
                             println!("Received invalid TelloGram {:?}", &buffer[..num_bytes]);
                             continue
+                        }
+
+                        match gram.id() {
+                            0x2 => {
+                                println!("Connected");
+                            },
+                            0x56 => {
+                                let data = FlightData::from(&gram.payload());
+                                println!("{:?}", data);
+                            },
+                            _ => {
+                                println!("Unhandled package type {}", gram.id());
+                            }
                         }
 
                         /*
@@ -219,16 +251,21 @@ fn main() {
         }
     });
 
-    /*
     let pipeline = gst::Pipeline::new(None);
-    let udpsrc = gst::ElementFactory::make("udpsrc", None).expect("Failed to create udpsrc");
+    // let udpsrc = gst::ElementFactory::make("udpsrc", None).expect("Failed to create udpsrc");
+    let source = gst::ElementFactory::make("appsrc", None).expect("Failed to create appsource");
+    let h264parse = gst::ElementFactory::make("h264parse", None).expect("Failed to create h264parse");
+    let avdec_h264 = gst::ElementFactory::make("avdec_h264", None).expect("Failed to create avdec_h264");
     let sink = gst::ElementFactory::make("appsink", None).expect("Failed to create appsink");
 
-    pipeline.add_many(&[&udpsrc, &sink]).expect("Failed to create pipeline");
-    udpsrc.link(&sink).expect("Failed to link sink");
+    pipeline.add_many(&[&source, &h264parse, &avdec_h264, &sink]).expect("Failed to create pipeline");
+    source.link(&h264parse).expect("Failed to link");
+    h264parse.link(&avdec_h264).expect("Failed to link");
+    avdec_h264.link(&sink).expect("Failed to link");
 
-    udpsrc.set_property("port", &(VIDEO_PORT as i32).to_value()).expect("Failed to set UDP port");
+    // source.set_property("port", &(VIDEO_PORT as i32).to_value()).expect("Failed to set UDP port");
 
+    let appsource = source.dynamic_cast::<gst_app::AppSrc>().expect("Pipeline should be an appsource!");
     let appsink = sink.dynamic_cast::<gst_app::AppSink>().expect("Pipeline should be an appsink!");
 
     pipeline.set_state(gst::State::Playing).expect("Failed to change pipeline state to play");
@@ -236,7 +273,25 @@ fn main() {
 
     let video_listen_thread_running = is_running.clone();
     let video_listen_thread = thread::spawn(move || {
+        let mut buffer = [0; 4096];            
         while (*video_listen_thread_running).load(Ordering::Relaxed) {
+            match video_socket.recv(&mut buffer) {
+                Ok(num_bytes) => {
+                    let mut databuf = vec![0; num_bytes - 2];
+                    for i in 0..num_bytes - 2 {
+                        databuf[i] = buffer[i + 2];
+                    }
+
+                    appsource.push_buffer(gst::buffer::Buffer::from_slice(databuf)).expect("Failed to push vidoe buffer");
+                },
+                Err(e) => println!("Failed to receive video buffer: {}", e)
+            }
+        }
+    });
+
+    let video_processor_thread_running = is_running.clone();
+    let video_processor_thread = thread::spawn(move || {
+        while (*video_processor_thread_running).load(Ordering::Relaxed) {
             match appsink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
                 Some(sample) => {
                     // sample..
@@ -245,7 +300,7 @@ fn main() {
                 None => println!("No video package received")
             }
         }
-    }); */
+    });
 
     let connect_request = TelloConnectRequest::connect(VIDEO_PORT);
 
@@ -264,6 +319,7 @@ fn main() {
     thread::sleep(time::Duration::from_secs(5));
     is_running.store(false, Ordering::Relaxed);
 
-    // video_listen_thread.join().expect("Failed to join video thread");
+    video_listen_thread.join().expect("Failed to join video listener thread");
+    video_processor_thread.join().expect("Failed to join video processor thread");
     cmd_listen_thread.join().expect("Failed to join cmd thread");
 }
