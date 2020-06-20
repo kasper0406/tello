@@ -4,8 +4,17 @@ version = "0.1.0"
 authors = ["Kasper Nielsen <kasper0406@gmail.com>"]
 edition = "2018"
 
+[[bin]]
+name = "player"
+path = "src/player.rs"
+
 [dependencies]
 gstreamer = "0.15.6"
+winit = "0.22.2"
+vulkano = "0.19.0"
+vulkano-win = "0.19.0"
+vulkano-shaders = "0.19.0"
+png = "0.16.5"
 
 [dependencies.gstreamer-app]
 version = "0.15.6"
