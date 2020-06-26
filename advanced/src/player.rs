@@ -4,7 +4,7 @@ use vulkano::instance::{ Instance, PhysicalDevice };
 use vulkano::device::{ Device, DeviceExtensions };
 use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
 use vulkano::format::Format;
-use vulkano::image::{ Dimensions, ImageUsage, ImmutableImage, SwapchainImage };
+use vulkano::image::{ Dimensions, ImageUsage, ImmutableImage, SwapchainImage, StorageImage };
 use vulkano::sampler::{ Sampler, Filter, MipmapMode, SamplerAddressMode };
 use vulkano::swapchain;
 use vulkano::swapchain::{ AcquireError, Swapchain, SurfaceTransform, CompositeAlpha, PresentMode, FullscreenExclusive, ColorSpace, SwapchainCreationError };
@@ -26,8 +26,8 @@ use std::sync::atomic::{ AtomicBool, Ordering };
 use std::time;
 
 struct Frame {
-    width: usize,
-    height: usize,
+    width: u32,
+    height: u32,
     data: Vec<u8>
 }
 
@@ -121,7 +121,7 @@ impl Player {
         Player { receiver }
     }
 
-    fn run(&mut self) {
+    fn run(self) {
         let instance = {
             let extensions = vulkano_win::required_extensions();
             Instance::new(None, &extensions, None).expect("Failed to create Vulkano instance")
@@ -196,7 +196,7 @@ impl Player {
                 position: [f32; 2],
             }
             vulkano::impl_vertex!(Vertex, position);
-    
+
             CpuAccessibleBuffer::from_iter(
                 device.clone(),
                 BufferUsage::vertex_buffer(),
@@ -235,28 +235,18 @@ impl Player {
             ).unwrap()
         );
 
-        let tex_ratio;
-        let (texture, tex_future) = {
-            let png_bytes = include_bytes!("test_image.png").to_vec();
-            let cursor = Cursor::new(png_bytes);
-            let decoder = png::Decoder::new(cursor);
-            let (info, mut reader) = decoder.read_info().unwrap();
-            let dimensions = Dimensions::Dim2d {
-                width: info.width,
-                height: info.height,
-            };
-            tex_ratio = (info.width as f32) / (info.height as f32);
-            let mut image_data = Vec::new();
-            image_data.resize((info.width * info.height * 4) as usize, 0);
-            reader.next_frame(&mut image_data).unwrap();
-    
-            ImmutableImage::from_iter(
-                image_data.iter().cloned(),
-                dimensions,
-                Format::R8G8B8A8Srgb,
-                queue.clone(),
-            ).unwrap()
+        // TODO(knielsen): Fix hardcoding of image frame size
+        let tex_ratio = (16 as f32) / (9 as f32);
+        let dimensions = Dimensions::Dim2d {
+            width: 1280,
+            height: 720,
         };
+        let frame_image = StorageImage::new(
+            device.clone(),
+            dimensions,
+            Format::R8G8B8A8Unorm,
+            Some(queue.family())
+        ).unwrap();
 
         let sampler = Sampler::new(
             device.clone(),
@@ -296,7 +286,7 @@ impl Player {
         let layout = pipeline.layout().descriptor_set_layout(0).unwrap();
         let set = Arc::new(
             PersistentDescriptorSet::start(layout.clone())
-                .add_sampled_image(texture.clone(), sampler.clone())
+                .add_sampled_image(frame_image.clone(), sampler.clone())
                 .unwrap()
                 .build()
                 .unwrap(),
@@ -305,7 +295,8 @@ impl Player {
         let mut framebuffers = window_size_dependent_setup(&images, render_pass.clone(), &mut dynamic_state);
 
         let mut recreate_swapchain = false;
-        let mut previous_frame_end = Some(tex_future.boxed());
+        // let mut previous_frame_end = Some(tex_future.boxed());
+        let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Poll;
@@ -325,6 +316,24 @@ impl Player {
                 },
                 Event::RedrawEventsCleared => {
                     previous_frame_end.as_mut().unwrap().cleanup_finished();
+
+                    let mut next_frame_data = None;
+                    let next_frame = self.receiver.try_recv();
+                    if !next_frame.is_err() {
+                        println!("Start allocate CPUAccesible buffer!");
+
+                        next_frame_data = Some(
+                            CpuAccessibleBuffer::from_iter(
+                                device.clone(),
+                                BufferUsage::transfer_source(),
+                                false,
+                                // next_frame.unwrap().data
+                                (0..1280 * 720 * 4).map(|_| 0u8)
+                            ).unwrap()
+                        );
+
+                        println!("End CPU Accessible buffer alloc");
+                    }
     
                     if recreate_swapchain {
                         let dimensions: [u32; 2] = surface.window().inner_size().into();
@@ -366,6 +375,11 @@ impl Player {
                         device.clone(),
                         queue.family(),
                     ).unwrap();
+
+                    if let Some(frame_data) = next_frame_data {
+                        builder.copy_buffer_to_image(frame_data.clone(), frame_image.clone()).unwrap();
+                    }
+
                     builder
                         .begin_render_pass(framebuffers[image_num].clone(), false, clear_values)
                         .unwrap()
@@ -383,8 +397,7 @@ impl Player {
                     let command_buffer = builder.build().unwrap();
 
                     let future = previous_frame_end
-                        .take()
-                        .unwrap()
+                        .take().unwrap()
                         .join(acquire_future)
                         .then_execute(queue.clone(), command_buffer)
                         .unwrap()
@@ -396,6 +409,7 @@ impl Player {
                             previous_frame_end = Some(future.boxed());
                         }
                         Err(FlushError::OutOfDate) => {
+                            println!("Some error");
                             recreate_swapchain = true;
                             previous_frame_end = Some(sync::now(device.clone()).boxed());
                         }
@@ -411,6 +425,21 @@ impl Player {
     }
 }
 
+fn parse_png_from_bytes(png_bytes: Vec<u8>) -> Frame {
+    let cursor = Cursor::new(png_bytes);
+    let decoder = png::Decoder::new(cursor);
+    let (info, mut reader) = decoder.read_info().unwrap();
+    let mut image_data = Vec::new();
+    image_data.resize((info.width * info.height * 4) as usize, 0);
+    reader.next_frame(&mut image_data).unwrap();
+
+    Frame {
+        width: info.width,
+        height: info.height,
+        data: image_data
+    }
+}
+
 fn main() {
     let (sender, receiver) = channel();
     let mut player = Player::new(receiver);
@@ -418,9 +447,20 @@ fn main() {
     let is_sending = Arc::new(AtomicBool::new(true));
     let is_sending_clone = is_sending.clone();
     let sender_thread = thread::spawn(move || {
+        let frames = vec![
+            parse_png_from_bytes(include_bytes!("test_image.png").to_vec()),
+            parse_png_from_bytes(include_bytes!("test_image_2.png").to_vec())
+        ];
+        let mut frames_iter = frames.iter().cycle();
+
         while (*is_sending_clone).load(Ordering::Relaxed) {
-            sender.send(Frame { width: 1280, height: 720, data: vec![] }).expect("Failed to send frame");
-            thread::sleep(time::Duration::from_millis(1000))
+            let frame = frames_iter.next().unwrap();
+            sender.send(Frame {
+                width: frame.width,
+                height: frame.height,
+                data: frame.data.clone()
+            }).expect("Failed to send frame");
+            thread::sleep(time::Duration::from_millis(100));
         }
     });
 
