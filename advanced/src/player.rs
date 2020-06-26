@@ -295,8 +295,14 @@ impl Player {
         let mut framebuffers = window_size_dependent_setup(&images, render_pass.clone(), &mut dynamic_state);
 
         let mut recreate_swapchain = false;
-        // let mut previous_frame_end = Some(tex_future.boxed());
         let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
+
+        let texture_buffer = CpuAccessibleBuffer::<[u8]>::from_iter(
+            device.clone(),
+            BufferUsage::transfer_source(),
+            false,
+            (0..1280 * 720 * 4).map(|_| 0u8)
+        ).unwrap();
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Poll;
@@ -317,22 +323,12 @@ impl Player {
                 Event::RedrawEventsCleared => {
                     previous_frame_end.as_mut().unwrap().cleanup_finished();
 
-                    let mut next_frame_data = None;
                     let next_frame = self.receiver.try_recv();
+                    let mut update_image = false;
                     if !next_frame.is_err() {
-                        println!("Start allocate CPUAccesible buffer!");
-
-                        next_frame_data = Some(
-                            CpuAccessibleBuffer::from_iter(
-                                device.clone(),
-                                BufferUsage::transfer_source(),
-                                false,
-                                // next_frame.unwrap().data
-                                (0..1280 * 720 * 4).map(|_| 0u8)
-                            ).unwrap()
-                        );
-
-                        println!("End CPU Accessible buffer alloc");
+                        let mut writer = texture_buffer.write().unwrap();
+                        writer.copy_from_slice(&next_frame.unwrap().data);
+                        update_image = true;
                     }
     
                     if recreate_swapchain {
@@ -376,8 +372,8 @@ impl Player {
                         queue.family(),
                     ).unwrap();
 
-                    if let Some(frame_data) = next_frame_data {
-                        builder.copy_buffer_to_image(frame_data.clone(), frame_image.clone()).unwrap();
+                    if update_image {
+                        builder.copy_buffer_to_image(texture_buffer.clone(), frame_image.clone()).unwrap();
                     }
 
                     builder
@@ -406,6 +402,7 @@ impl Player {
 
                     match future {
                         Ok(future) => {
+                            future.wait(None).unwrap();
                             previous_frame_end = Some(future.boxed());
                         }
                         Err(FlushError::OutOfDate) => {
@@ -460,7 +457,7 @@ fn main() {
                 height: frame.height,
                 data: frame.data.clone()
             }).expect("Failed to send frame");
-            thread::sleep(time::Duration::from_millis(100));
+            thread::sleep(time::Duration::from_millis(15));
         }
     });
 
