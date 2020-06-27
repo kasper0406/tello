@@ -4,7 +4,7 @@ use vulkano::instance::{ Instance, PhysicalDevice };
 use vulkano::device::{ Device, DeviceExtensions };
 use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
 use vulkano::format::Format;
-use vulkano::image::{ Dimensions, ImageUsage, ImmutableImage, SwapchainImage, StorageImage };
+use vulkano::image::{ Dimensions, ImageUsage, SwapchainImage, StorageImage };
 use vulkano::sampler::{ Sampler, Filter, MipmapMode, SamplerAddressMode };
 use vulkano::swapchain;
 use vulkano::swapchain::{ AcquireError, Swapchain, SurfaceTransform, CompositeAlpha, PresentMode, FullscreenExclusive, ColorSpace, SwapchainCreationError };
