@@ -1,4 +1,6 @@
 mod crc;
+mod player;
+
 extern crate gstreamer as gst;
 extern crate gstreamer_app as gst_app;
 
@@ -13,6 +15,8 @@ use std::sync::atomic::{ AtomicBool, Ordering };
 use std::slice;
 use std::assert;
 use std::time::Duration;
+
+use std::sync::mpsc::{ channel };
 
 const TELLO_CMD_PORT: u16 = 8889;
 const LOCAL_CMD_PORT: u16 = 8800;
@@ -252,24 +256,33 @@ fn main() {
     });
 
     let pipeline = gst::Pipeline::new(None);
-    // let udpsrc = gst::ElementFactory::make("udpsrc", None).expect("Failed to create udpsrc");
     let source = gst::ElementFactory::make("appsrc", None).expect("Failed to create appsource");
     let h264parse = gst::ElementFactory::make("h264parse", None).expect("Failed to create h264parse");
     let avdec_h264 = gst::ElementFactory::make("avdec_h264", None).expect("Failed to create avdec_h264");
+    let videoconvert = gst::ElementFactory::make("videoconvert", None).expect("Failed to create videoconvert");
     let sink = gst::ElementFactory::make("appsink", None).expect("Failed to create appsink");
 
-    pipeline.add_many(&[&source, &h264parse, &avdec_h264, &sink]).expect("Failed to create pipeline");
+    pipeline.add_many(&[&source, &h264parse, &avdec_h264, &videoconvert, &sink]).expect("Failed to create pipeline");
     source.link(&h264parse).expect("Failed to link");
     h264parse.link(&avdec_h264).expect("Failed to link");
-    avdec_h264.link(&sink).expect("Failed to link");
-
-    // source.set_property("port", &(VIDEO_PORT as i32).to_value()).expect("Failed to set UDP port");
+    avdec_h264.link(&videoconvert).expect("Failed to link");
+    videoconvert.link(&sink).expect("Failed to link");
 
     let appsource = source.dynamic_cast::<gst_app::AppSrc>().expect("Pipeline should be an appsource!");
     let appsink = sink.dynamic_cast::<gst_app::AppSink>().expect("Pipeline should be an appsink!");
 
+    appsource.set_latency(gst::ClockTime::from_mseconds(0), gst::ClockTime::from_mseconds(10));
+    appsource.set_property_is_live(true);
+    appsource.set_stream_type(gst_app::AppStreamType::Stream);
+
+    appsink.set_caps(Some(&gst::Caps::new_simple(
+        "video/x-raw",
+        &[
+            ("format", &"RGBA")
+        ]
+    )));
+
     pipeline.set_state(gst::State::Playing).expect("Failed to change pipeline state to play");
-    let bus = pipeline.get_bus().expect("Faield to get video bus");
 
     let video_listen_thread_running = is_running.clone();
     let video_listen_thread = thread::spawn(move || {
@@ -290,35 +303,49 @@ fn main() {
     });
 
     let video_processor_thread_running = is_running.clone();
+    let (video_sender, video_receiver) = channel();
     let video_processor_thread = thread::spawn(move || {
         while (*video_processor_thread_running).load(Ordering::Relaxed) {
             match appsink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
                 Some(sample) => {
-                    // sample..
-                    println!("Received sample: {:?}", sample)
+                    // TODO: Get width, height from Sample::caps
+
+                    let buffer = sample.get_buffer().unwrap();
+                    let mut data = vec![0; buffer.get_size()];
+                    buffer.copy_to_slice(0, &mut data).unwrap();
+
+                    video_sender.send(player::Frame {
+                        width: 960,
+                        height: 720,
+                        data: data
+                    }).expect("Failed to send frame");
                 },
-                None => println!("No video package received")
+                None => ()
             }
         }
     });
 
+    
+    let player = player::Player::new(video_receiver);
     let connect_request = TelloConnectRequest::connect(VIDEO_PORT);
 
     println!("Sending bytes to Tello {:?}", connect_request.as_bytes().as_slice());
     cmd_socket_write.send(connect_request.as_bytes().as_slice()).expect("Failed to send command to Tello");
 
-    thread::sleep(time::Duration::from_millis(500));
+    let video_ping_thread_running = is_running.clone();
+    let video_package_ping_thread = thread::spawn(move || {
+        while (*video_ping_thread_running).load(Ordering::Relaxed) {
+            let spspps_video_req = TelloGram::construct_package(4, 0x25, 0, &[]);
+            cmd_socket_write.send(&spspps_video_req).expect("Failed to send video request");
+            thread::sleep(time::Duration::from_millis(2000));
+        }
+    });
 
-    let spspps_video_req = TelloGram::construct_package(4, 0x25, 0, &[]);
-    let gram = unsafe { &*spspps_video_req.as_ptr().cast::<TelloGram>() };
-    println!("Is video gram valid? {}", gram.is_valid());
+    player.run();
 
-    println!("Send video package to Tello {:?}", spspps_video_req);
-    cmd_socket_write.send(&spspps_video_req).expect("Failed to send video request");
-
-    thread::sleep(time::Duration::from_secs(5));
     is_running.store(false, Ordering::Relaxed);
 
+    video_package_ping_thread.join().expect("Failed to join video ping thread");
     video_listen_thread.join().expect("Failed to join video listener thread");
     video_processor_thread.join().expect("Failed to join video processor thread");
     cmd_listen_thread.join().expect("Failed to join cmd thread");

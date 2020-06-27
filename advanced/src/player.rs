@@ -1,11 +1,11 @@
 use vulkano_win::VkSurfaceBuild;
-use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
-use vulkano::instance::{ Instance, PhysicalDevice };
+use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer, BufferAccess};
+use vulkano::instance::{ Instance, PhysicalDevice, QueueFamily };
 use vulkano::device::{ Device, DeviceExtensions };
 use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
 use vulkano::format::Format;
 use vulkano::image::{ Dimensions, ImageUsage, SwapchainImage, StorageImage };
-use vulkano::sampler::{ Sampler, Filter, MipmapMode, SamplerAddressMode };
+use vulkano::sampler::{ Sampler, Filter, MipmapMode, SamplerAddressMode, BorderColor };
 use vulkano::swapchain;
 use vulkano::swapchain::{ AcquireError, Swapchain, SurfaceTransform, CompositeAlpha, PresentMode, FullscreenExclusive, ColorSpace, SwapchainCreationError };
 use vulkano::pipeline::GraphicsPipeline;
@@ -25,13 +25,13 @@ use std::thread;
 use std::sync::atomic::{ AtomicBool, Ordering };
 use std::time;
 
-struct Frame {
-    width: u32,
-    height: u32,
-    data: Vec<u8>
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>
 }
 
-struct Player {
+pub struct Player {
     receiver: Receiver<Frame>
 }
 
@@ -116,15 +116,42 @@ fn window_size_dependent_setup(
         .collect::<Vec<_>>()
 }
 
+fn alloc_video_frame_buffers(device: Arc<Device>, queue_family: QueueFamily, width: u32, height: u32)
+    -> (Arc<StorageImage<Format>>, Arc<CpuAccessibleBuffer<[u8]>>)
+{
+    let dimensions = Dimensions::Dim2d {
+        width: width,
+        height: height,
+    };
+    let frame_image = StorageImage::new(
+        device.clone(),
+        dimensions,
+        Format::R8G8B8A8Unorm,
+        Some(queue_family)
+    ).unwrap();
+
+    let texture_buffer = CpuAccessibleBuffer::<[u8]>::from_iter(
+        device.clone(),
+        BufferUsage::transfer_source(),
+        false,
+        (0..width * height * 4).map(|_| 0u8)
+    ).unwrap();
+
+    (frame_image, texture_buffer)
+}
+
 impl Player {
-    fn new(receiver: Receiver<Frame>) -> Player {
+    pub fn new(receiver: Receiver<Frame>) -> Player {
         Player { receiver }
     }
 
-    fn run(self) {
+    pub fn run(self) {
         let instance = {
             let extensions = vulkano_win::required_extensions();
-            Instance::new(None, &extensions, None).expect("Failed to create Vulkano instance")
+            match Instance::new(None, &extensions, None) {
+                Ok(inst) => inst,
+                Err(e) => panic!("Failed to initialize vulkano instance: {:?}", e)
+            }
         };
 
         println!("Available physical devices:");
@@ -235,27 +262,17 @@ impl Player {
             ).unwrap()
         );
 
-        // TODO(knielsen): Fix hardcoding of image frame size
-        let tex_ratio = (16 as f32) / (9 as f32);
-        let dimensions = Dimensions::Dim2d {
-            width: 1280,
-            height: 720,
-        };
-        let frame_image = StorageImage::new(
-            device.clone(),
-            dimensions,
-            Format::R8G8B8A8Unorm,
-            Some(queue.family())
-        ).unwrap();
+        let mut tex_ratio = (1 as f32) / (1 as f32);
+        let (mut frame_image, mut texture_buffer) = alloc_video_frame_buffers(device.clone(), queue.family(), 1, 1);
 
         let sampler = Sampler::new(
             device.clone(),
             Filter::Linear,
             Filter::Linear,
             MipmapMode::Nearest,
-            SamplerAddressMode::ClampToEdge,
-            SamplerAddressMode::ClampToEdge,
-            SamplerAddressMode::ClampToEdge,
+            SamplerAddressMode::ClampToBorder(BorderColor::IntTransparentBlack),
+            SamplerAddressMode::ClampToBorder(BorderColor::IntTransparentBlack),
+            SamplerAddressMode::ClampToBorder(BorderColor::IntTransparentBlack),
             0.0,
             1.0,
             0.0,
@@ -283,8 +300,8 @@ impl Player {
             reference: None,
         };
 
-        let layout = pipeline.layout().descriptor_set_layout(0).unwrap();
-        let set = Arc::new(
+        let layout = pipeline.layout().descriptor_set_layout(0).unwrap().clone();
+        let mut set = Arc::new(
             PersistentDescriptorSet::start(layout.clone())
                 .add_sampled_image(frame_image.clone(), sampler.clone())
                 .unwrap()
@@ -296,13 +313,6 @@ impl Player {
 
         let mut recreate_swapchain = false;
         let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
-
-        let texture_buffer = CpuAccessibleBuffer::<[u8]>::from_iter(
-            device.clone(),
-            BufferUsage::transfer_source(),
-            false,
-            (0..1280 * 720 * 4).map(|_| 0u8)
-        ).unwrap();
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Poll;
@@ -326,8 +336,24 @@ impl Player {
                     let next_frame = self.receiver.try_recv();
                     let mut update_image = false;
                     if !next_frame.is_err() {
+                        let frame = next_frame.unwrap();
+                        if frame.data.len() != texture_buffer.size() {
+                            println!("Allocating new buffers for image ({}, {})", frame.width, frame.height);
+                            tex_ratio = (frame.width as f32) / (frame.height as f32);
+                            let (new_frame_image, new_texture_buffer) = alloc_video_frame_buffers(
+                                device.clone(), queue.family(), frame.width, frame.height);
+                            frame_image = new_frame_image;
+                            texture_buffer = new_texture_buffer;
+
+                            set = Arc::new(PersistentDescriptorSet::start(layout.clone())
+                                    .add_sampled_image(frame_image.clone(), sampler.clone())
+                                    .unwrap()
+                                    .build()
+                                    .unwrap());
+                        }
+
                         let mut writer = texture_buffer.write().unwrap();
-                        writer.copy_from_slice(&next_frame.unwrap().data);
+                        writer.copy_from_slice(&frame.data);
                         update_image = true;
                     }
     
@@ -457,7 +483,7 @@ fn main() {
                 height: frame.height,
                 data: frame.data.clone()
             }).expect("Failed to send frame");
-            thread::sleep(time::Duration::from_millis(15));
+            thread::sleep(time::Duration::from_millis(1000));
         }
     });
 

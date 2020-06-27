@@ -8,6 +8,10 @@ edition = "2018"
 name = "player"
 path = "src/player.rs"
 
+[[bin]]
+name = "tello"
+path = "src/tello.rs"
+
 [dependencies]
 gstreamer = "0.15.6"
 winit = "0.22.2"
