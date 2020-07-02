@@ -175,7 +175,7 @@ impl<'a> TelloConnectRequest<'a> {
 
 impl<'a> NetworkPackage for TelloConnectRequest<'a> {
     fn as_bytes(&self) -> Vec<u8> {
-        const COLON: u8 = 0x3a; // ':' in ascii
+        const COLON: u8 = ':' as u8;
         let command_bytes = self.cmd.as_bytes();
         let mut bytes: Vec<u8> = Vec::with_capacity(command_bytes.len() + 3);
 
