@@ -61,7 +61,7 @@ enum TelloGramDirection {
 
 #[derive(Debug)]
 enum Commands {
-    VideoRequest,
+    VideoSPSPPS,
     Takeoff,
     Land,
     Joystick { lx: f32, ly: f32, rx: f32, ry: f32 },
@@ -186,7 +186,7 @@ impl TelloGram {
 
     fn from(command: Commands, seq: u16) -> Vec<u8> {
         match command {
-            Commands::VideoRequest => TelloGram::construct_package(PackageType::Data2, 0x25, seq, &[]),
+            Commands::VideoSPSPPS => TelloGram::construct_package(PackageType::Data2, 0x25, seq, &[]),
             Commands::Takeoff => TelloGram::construct_package(PackageType::Set, 0x54, seq, &[]),
             Commands::Land => TelloGram::construct_package(PackageType::Set, 0x55, seq, &vec![0]),
             Commands::Joystick { lx, ly, rx, ry } => {
@@ -265,14 +265,32 @@ impl State {
 struct Tello {
     state: Arc<Mutex<State>>,
 
+    is_running: Arc<AtomicBool>,
+
     cmd_listen_thread: Option<thread::JoinHandle<()>>,
     cmd_queue: UdpSocket,
-    seq_nr: AtomicU16,
+    seq_nr: Arc<AtomicU16>,
+
+    video_raw_receive_thread: Option<thread::JoinHandle<()>>,
+    video_frame_thread: Option<thread::JoinHandle<()>>,
+    video_ping_thread: Option<thread::JoinHandle<()>>,
+}
+
+macro_rules! join_thread {
+    ($x:expr) => {
+        if let Some(thread) = $x.take() {
+            thread.join().unwrap();
+        }
+    };
 }
 
 impl Drop for Tello {
     fn drop(&mut self) {
-        self.cmd_listen_thread.take().unwrap().join().unwrap();
+        join_thread!(self.cmd_listen_thread);
+
+        join_thread!(self.video_raw_receive_thread);
+        join_thread!(self.video_frame_thread);
+        join_thread!(self.video_ping_thread);
     }
 }
 
@@ -313,10 +331,16 @@ impl Tello {
         }
 
         Ok(Tello {
+            is_running,
+
             cmd_listen_thread,
             cmd_queue,
             state,
-            seq_nr: AtomicU16::new(0),
+            seq_nr: Arc::new(AtomicU16::new(0)),
+
+            video_raw_receive_thread: None,
+            video_frame_thread: None,
+            video_ping_thread: None
         })
     }
 
@@ -414,11 +438,103 @@ impl Tello {
             }
         }
     }
+
+    fn start_video(&mut self, frame_channel: Sender<player::Frame>) {
+        let (appsource, appsink) = Self::initialize_video_pipeline();
+
+        let video_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], VIDEO_PORT))).expect("Failed to create video socket");
+
+        let tello_video_listen_thread_running = self.is_running.clone();
+        self.video_raw_receive_thread = Some(thread::spawn(move || {
+            let mut buffer = [0; 4096];            
+            while (*tello_video_listen_thread_running).load(Ordering::Relaxed) {
+                match video_socket.recv(&mut buffer) {
+                    Ok(num_bytes) => {
+                        let mut databuf = vec![0; num_bytes - 2];
+                        for i in 0..num_bytes - 2 {
+                            databuf[i] = buffer[i + 2];
+                        }
+
+                        appsource.push_buffer(gst::buffer::Buffer::from_slice(databuf)).expect("Failed to push vidoe buffer");
+                    },
+                    Err(e) => println!("Failed to receive video buffer: {}", e)
+                }
+            }
+        }));
+
+        let video_processor_thread_running = self.is_running.clone();
+        self.video_frame_thread = Some(thread::spawn(move || {
+            while (*video_processor_thread_running).load(Ordering::Relaxed) {
+                match appsink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
+                    Some(sample) => {
+                        // TODO: Get width, height from Sample::caps
+
+                        let buffer = sample.get_buffer().unwrap();
+                        let mut data = vec![0; buffer.get_size()];
+                        buffer.copy_to_slice(0, &mut data).unwrap();
+
+                        frame_channel.send(player::Frame {
+                            width: 960,
+                            height: 720,
+                            data: data
+                        }).expect("Failed to send frame");
+                    },
+                    None => ()
+                }
+            }
+        }));
+
+        let video_ping_thread_running = self.is_running.clone();
+        let tello_cmd = self.cmd_queue.try_clone().unwrap();
+        let sequence_number = self.seq_nr.clone();
+        self.video_ping_thread = Some(thread::spawn(move || {
+            while (*video_ping_thread_running).load(Ordering::Relaxed) {
+                tello_cmd.send(&TelloGram::from(
+                    Commands::VideoSPSPPS,
+                    sequence_number.fetch_add(1, Ordering::SeqCst)
+                )).expect("Failed to send video request");
+                thread::sleep(time::Duration::from_millis(2000));
+            }
+        }));
+    }
+
+    fn initialize_video_pipeline() -> (gst_app::AppSrc, gst_app::AppSink) {
+        gst::init().expect("Failed to init gstreamer");
+
+        let pipeline = gst::Pipeline::new(None);
+        let source = gst::ElementFactory::make("appsrc", None).expect("Failed to create appsource");
+        let h264parse = gst::ElementFactory::make("h264parse", None).expect("Failed to create h264parse");
+        let avdec_h264 = gst::ElementFactory::make("avdec_h264", None).expect("Failed to create avdec_h264");
+        let videoconvert = gst::ElementFactory::make("videoconvert", None).expect("Failed to create videoconvert");
+        let sink = gst::ElementFactory::make("appsink", None).expect("Failed to create appsink");
+
+        pipeline.add_many(&[&source, &h264parse, &avdec_h264, &videoconvert, &sink]).expect("Failed to create pipeline");
+        source.link(&h264parse).expect("Failed to link");
+        h264parse.link(&avdec_h264).expect("Failed to link");
+        avdec_h264.link(&videoconvert).expect("Failed to link");
+        videoconvert.link(&sink).expect("Failed to link");
+
+        let appsource = source.dynamic_cast::<gst_app::AppSrc>().expect("Pipeline should be an appsource!");
+        let appsink = sink.dynamic_cast::<gst_app::AppSink>().expect("Pipeline should be an appsink!");
+
+        appsource.set_latency(gst::ClockTime::from_mseconds(0), gst::ClockTime::from_mseconds(10));
+        appsource.set_property_is_live(true);
+        appsource.set_stream_type(gst_app::AppStreamType::Stream);
+
+        appsink.set_caps(Some(&gst::Caps::new_simple(
+            "video/x-raw",
+            &[
+                ("format", &"RGBA")
+            ]
+        )));
+
+        pipeline.set_state(gst::State::Playing).expect("Failed to change pipeline state to play");
+
+        (appsource, appsink)
+    }
 }
 
 fn main() {
-    gst::init().expect("Failed to init gstreamer");
-
     let is_running = Arc::new(AtomicBool::new(true));
 
     let (controller_events_sender, controller_events_receiver) = channel();
@@ -431,10 +547,15 @@ fn main() {
         controller.start(controller_is_running);
     });
 
-    let tello = Tello::connect(VIDEO_PORT).unwrap();
+    let mut tello = Tello::connect(VIDEO_PORT).unwrap();
 
+    let (video_sender, video_receiver) = channel();
+    let player = player::Player::new(video_receiver);
+    tello.start_video(video_sender);
+
+    let tello_cmd_loop_running = is_running.clone();
     let tello_cmd_loop = thread::spawn(move || {
-        loop {
+        while (*tello_cmd_loop_running).load(Ordering::Relaxed) {
             if let Ok(event) = controller_events_receiver.recv_timeout(Duration::from_millis(10)) {
                 match event {
                     controller::Event::XPress => tello.takeoff(),
@@ -447,108 +568,10 @@ fn main() {
         }
     });
 
-    tello_cmd_loop.join().unwrap();
-    controller_thread.join().unwrap();
-    
-
-    /*
-    let is_running = Arc::new(AtomicBool::new(true));
-
-    let video_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], VIDEO_PORT))).expect("Failed to create video socket");
-
-    let pipeline = gst::Pipeline::new(None);
-    let source = gst::ElementFactory::make("appsrc", None).expect("Failed to create appsource");
-    let h264parse = gst::ElementFactory::make("h264parse", None).expect("Failed to create h264parse");
-    let avdec_h264 = gst::ElementFactory::make("avdec_h264", None).expect("Failed to create avdec_h264");
-    let videoconvert = gst::ElementFactory::make("videoconvert", None).expect("Failed to create videoconvert");
-    let sink = gst::ElementFactory::make("appsink", None).expect("Failed to create appsink");
-
-    pipeline.add_many(&[&source, &h264parse, &avdec_h264, &videoconvert, &sink]).expect("Failed to create pipeline");
-    source.link(&h264parse).expect("Failed to link");
-    h264parse.link(&avdec_h264).expect("Failed to link");
-    avdec_h264.link(&videoconvert).expect("Failed to link");
-    videoconvert.link(&sink).expect("Failed to link");
-
-    let appsource = source.dynamic_cast::<gst_app::AppSrc>().expect("Pipeline should be an appsource!");
-    let appsink = sink.dynamic_cast::<gst_app::AppSink>().expect("Pipeline should be an appsink!");
-
-    appsource.set_latency(gst::ClockTime::from_mseconds(0), gst::ClockTime::from_mseconds(10));
-    appsource.set_property_is_live(true);
-    appsource.set_stream_type(gst_app::AppStreamType::Stream);
-
-    appsink.set_caps(Some(&gst::Caps::new_simple(
-        "video/x-raw",
-        &[
-            ("format", &"RGBA")
-        ]
-    )));
-
-    pipeline.set_state(gst::State::Playing).expect("Failed to change pipeline state to play");
-
-    let video_listen_thread_running = is_running.clone();
-    let video_listen_thread = thread::spawn(move || {
-        let mut buffer = [0; 4096];            
-        while (*video_listen_thread_running).load(Ordering::Relaxed) {
-            match video_socket.recv(&mut buffer) {
-                Ok(num_bytes) => {
-                    let mut databuf = vec![0; num_bytes - 2];
-                    for i in 0..num_bytes - 2 {
-                        databuf[i] = buffer[i + 2];
-                    }
-
-                    appsource.push_buffer(gst::buffer::Buffer::from_slice(databuf)).expect("Failed to push vidoe buffer");
-                },
-                Err(e) => println!("Failed to receive video buffer: {}", e)
-            }
-        }
-    });
-
-    let video_processor_thread_running = is_running.clone();
-    let (video_sender, video_receiver) = channel();
-    let video_processor_thread = thread::spawn(move || {
-        while (*video_processor_thread_running).load(Ordering::Relaxed) {
-            match appsink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
-                Some(sample) => {
-                    // TODO: Get width, height from Sample::caps
-
-                    let buffer = sample.get_buffer().unwrap();
-                    let mut data = vec![0; buffer.get_size()];
-                    buffer.copy_to_slice(0, &mut data).unwrap();
-
-                    video_sender.send(player::Frame {
-                        width: 960,
-                        height: 720,
-                        data: data
-                    }).expect("Failed to send frame");
-                },
-                None => ()
-            }
-        }
-    });
-
-    
-    let player = player::Player::new(video_receiver);
-    let connect_request = TelloConnectRequest::connect(VIDEO_PORT);
-
-    println!("Sending bytes to Tello {:?}", connect_request.as_bytes().as_slice());
-    cmd_socket_write.send(connect_request.as_bytes().as_slice()).expect("Failed to send command to Tello");
-
-    let video_ping_thread_running = is_running.clone();
-    let video_package_ping_thread = thread::spawn(move || {
-        while (*video_ping_thread_running).load(Ordering::Relaxed) {
-            let spspps_video_req = TelloGram::construct_package(4, 0x25, 0, &[]);
-            cmd_socket_write.send(&spspps_video_req).expect("Failed to send video request");
-            thread::sleep(time::Duration::from_millis(2000));
-        }
-    });
-
     player.run();
 
     is_running.store(false, Ordering::Relaxed);
 
-    video_package_ping_thread.join().expect("Failed to join video ping thread");
-    video_listen_thread.join().expect("Failed to join video listener thread");
-    video_processor_thread.join().expect("Failed to join video processor thread");
-    cmd_listen_thread.join().expect("Failed to join cmd thread");
-    */
+    tello_cmd_loop.join().unwrap();
+    controller_thread.join().unwrap();
 }
