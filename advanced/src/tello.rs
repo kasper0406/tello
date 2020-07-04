@@ -1,5 +1,6 @@
 mod crc;
 mod player;
+mod controller;
 
 extern crate gstreamer as gst;
 extern crate gstreamer_app as gst_app;
@@ -10,13 +11,14 @@ use std::net::{ SocketAddr, UdpSocket };
 use std::convert::TryInto;
 use std::thread;
 use std::time;
-use std::sync::Arc;
-use std::sync::atomic::{ AtomicBool, Ordering };
+use std::sync::{ Arc, Mutex, Condvar };
+use std::sync::atomic::{ AtomicBool, AtomicU16, Ordering };
 use std::slice;
 use std::assert;
 use std::time::Duration;
+use chrono::{ Utc, Timelike };
 
-use std::sync::mpsc::{ channel };
+use std::sync::mpsc::{ channel, Receiver, Sender };
 
 const TELLO_CMD_PORT: u16 = 8889;
 const LOCAL_CMD_PORT: u16 = 8800;
@@ -55,6 +57,30 @@ impl FlightData {
 #[derive(Debug)]
 enum TelloGramDirection {
     ToDrone, FromDrone, Unknown
+}
+
+#[derive(Debug)]
+enum Commands {
+    VideoRequest,
+    Takeoff,
+    Land,
+    Joystick { lx: f32, ly: f32, rx: f32, ry: f32 },
+}
+
+enum PackageType {
+    Get,
+    Set,
+    Data2
+}
+
+impl PackageType {
+    fn to_u8(&self) -> u8 {
+        match self {
+            Get => 1,
+            Data2 => 4,
+            Set => 5,
+        }
+    }
 }
 
 impl TelloGram {
@@ -128,7 +154,7 @@ impl TelloGram {
             && crc::calculate_crc16(payload_slice) == self.crc16();
     }
 
-    fn construct_package(packet_type: u8, command: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    fn construct_package(packet_type: PackageType, command: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
         let packet_size = TelloGram::GRAM_SIZE + payload.len();
 
         let mut buffer = vec![0; packet_size];
@@ -137,7 +163,7 @@ impl TelloGram {
         gram.m_size = (packet_size << 3) as u16;
         gram.m_crc8 = crc::calculate_crc8(&buffer[..3]);
         gram.m_discriminator |= 0x40;
-        gram.m_discriminator |= (packet_type << 3) & 0x38;
+        gram.m_discriminator |= (packet_type.to_u8() << 3) & 0x38;
         // gram.m_discriminator |= packet_subtype & 0x7;
         gram.m_id = command;
         gram.m_sequence = seq;
@@ -152,6 +178,40 @@ impl TelloGram {
         buffer[packet_size - 1] = crc16_buf[0];
 
         buffer
+    }
+
+    fn tello_position(position: f32) -> u64 {
+        (1024f32 + (position * 660f32)) as u64
+    }
+
+    fn from(command: Commands, seq: u16) -> Vec<u8> {
+        match command {
+            Commands::VideoRequest => TelloGram::construct_package(PackageType::Data2, 0x25, seq, &[]),
+            Commands::Takeoff => TelloGram::construct_package(PackageType::Set, 0x54, seq, &[]),
+            Commands::Land => TelloGram::construct_package(PackageType::Set, 0x55, seq, &vec![0]),
+            Commands::Joystick { lx, ly, rx, ry } => {
+                let mut encoded_position = Self::tello_position(lx) & 0x7ff;
+                encoded_position |= (Self::tello_position(-ly) & 0x7ff) << 11;
+                encoded_position |= (Self::tello_position(-ry) & 0x7ff) << 22;
+                encoded_position |= (Self::tello_position(rx) & 0x7ff) << 33;
+                // encoded_position |= 1u64 << 44; // if sports mode enabled
+
+                let mut payload = [0u8; 11];
+                for i in 0..6 {
+                    payload[i] = (encoded_position >> (8 * i)) as u8;
+                }
+
+                let now = Utc::now();
+                payload[6] = now.hour() as u8;
+                payload[7] = now.minute() as u8;
+                payload[8] = now.second() as u8;
+                let ms = now.nanosecond() / 1_000_000;
+                payload[9] = ms as u8;
+                payload[10] = (ms >> 8) as u8;
+
+                TelloGram::construct_package(PackageType::Data2, 0x50, 0, &payload)
+            }
+        }
     }
 }
 
@@ -188,31 +248,131 @@ impl<'a> NetworkPackage for TelloConnectRequest<'a> {
     }
 }
 
-fn main() {
-    gst::init().expect("Failed to init gstreamer");
+struct State {
+    is_connected: bool,
+    is_flying: bool,
+}
 
-    let is_running = Arc::new(AtomicBool::new(true));
+impl State {
+    fn new() -> State {
+        State {
+            is_connected: false,
+            is_flying: false,
+        }
+    }
+}
 
-    let cmd_bind_addr = SocketAddr::from(([0, 0, 0, 0], LOCAL_CMD_PORT));
-    let cmd_socket_write = UdpSocket::bind(cmd_bind_addr).expect("Unable to create UDP command socket");
-    cmd_socket_write.connect(SocketAddr::from((TELLO_IP, TELLO_CMD_PORT))).expect("Failed to connect to Tello command");
+struct Tello {
+    state: Arc<Mutex<State>>,
 
-    let cmd_socket_read = cmd_socket_write.try_clone().expect("Failed to clone socket");
-    cmd_socket_read.set_read_timeout(Some(Duration::from_secs(1))).expect("Failed to set cmd read timeout");
+    cmd_listen_thread: Option<thread::JoinHandle<()>>,
+    cmd_queue: UdpSocket,
+    seq_nr: AtomicU16,
+}
 
-    let video_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], VIDEO_PORT))).expect("Failed to create video socket");
+impl Drop for Tello {
+    fn drop(&mut self) {
+        self.cmd_listen_thread.take().unwrap().join().unwrap();
+    }
+}
 
-    let cmd_listen_thread_running = is_running.clone();
-    let cmd_listen_thread = thread::spawn(move || {
+impl Tello {
+    fn connect(video_port: u16) -> Result<Tello, &'static str> {
+        let cmd_bind_addr = SocketAddr::from(([0, 0, 0, 0], LOCAL_CMD_PORT));
+        let cmd_queue = UdpSocket::bind(cmd_bind_addr).expect("Unable to create UDP command socket");
+        cmd_queue.connect(SocketAddr::from((TELLO_IP, TELLO_CMD_PORT))).expect("Failed to connect to Tello command");
+
+        let cmd_socket_read = cmd_queue.try_clone().expect("Failed to clone socket");
+        cmd_socket_read.set_read_timeout(Some(Duration::from_secs(1))).expect("Failed to set cmd read timeout");
+
+        let state = Arc::new(Mutex::new(State::new()));
+        let is_running = Arc::new(AtomicBool::new(true));
+
+        let connect_condition = Arc::new((Mutex::new(false), Condvar::new()));
+        let connect_condition_signaller = connect_condition.clone();
+
+        let is_running_cmd_listen = is_running.clone();
+        let state_cmd_listen = state.clone();
+        let cmd_listen_thread = Some(thread::spawn(move || {
+            Self::handle_tello_msg(is_running_cmd_listen, cmd_socket_read, state_cmd_listen, connect_condition_signaller)
+        }));
+
+        let connect_request = TelloConnectRequest::connect(video_port);
+        cmd_queue.send(connect_request.as_bytes().as_slice()).expect("Failed to send command to Tello");
+
+        {
+            let (lock, cvar) = &*connect_condition;
+            let result = cvar.wait_timeout_while(
+                lock.lock().unwrap(),
+                Duration::from_secs(10),
+                |&mut connected| !connected,
+            ).unwrap();
+            if result.1.timed_out() {
+                return Err("Timed out connecting to Tello");
+            }
+        }
+
+        Ok(Tello {
+            cmd_listen_thread,
+            cmd_queue,
+            state,
+            seq_nr: AtomicU16::new(0),
+        })
+    }
+
+    fn takeoff(&self) {
+        self.send_raw(&TelloGram::from(
+            Commands::Takeoff,
+            self.seq_nr.fetch_add(1, Ordering::SeqCst)
+        ));
+    }
+
+    fn land(&self) {
+        self.send_raw(&TelloGram::from(
+            Commands::Land,
+            self.seq_nr.fetch_add(1, Ordering::SeqCst)
+        ));
+    }
+
+    fn set_joystick(&self, controller: controller::State) {
+        self.send_raw(&TelloGram::from(
+            Commands::Joystick {
+                lx: controller.joystick_left_x,
+                ly: controller.joystick_left_y,
+                rx: controller.joystick_right_x,
+                ry: controller.joystick_right_y
+            },
+            0 // unused
+        ));
+    }
+
+    fn send_raw(&self, data: &[u8]) {
+        let gram = unsafe { &*data.as_ptr().cast::<TelloGram>() };
+        if !gram.is_valid() {
+            println!("Sending invalid TelloGram {:?}", &data);
+        }
+
+        self.cmd_queue.send(data).unwrap();
+    }
+
+    fn handle_tello_msg(is_running: Arc<AtomicBool>,
+                        cmd_socket_read: UdpSocket,
+                        state: Arc<Mutex<State>>,
+                        connect_condition: Arc<(Mutex<bool>, Condvar)>) {
         let mut buffer: [u8; 4096] = [0; 4096];
-        
-        while (*cmd_listen_thread_running).load(Ordering::Relaxed) {
+            
+        while (*is_running).load(Ordering::Relaxed) {
             match cmd_socket_read.recv(&mut buffer) {
                 Ok(num_bytes) => {
                     // println!("Command package of {} bytes: {:?}", num_bytes, &buffer[..num_bytes]);
 
                     if buffer.starts_with("conn_ack:".as_bytes()) {
-                        println!("Connected to Tello!");
+                        state.lock().unwrap().is_connected = true;
+
+                        // Signal connection to initializer
+                        let (lock, cvar) = &*connect_condition;
+                        *(lock.lock().unwrap()) = true;
+                        cvar.notify_one();
                     } else {
                         // Interpret as TelloGram
                         let gram = unsafe { &*buffer.as_ptr().cast::<TelloGram>() };
@@ -224,7 +384,7 @@ fn main() {
 
                         match gram.id() {
                             0x2 => {
-                                println!("Connected");
+                                print!("0x2 connected received !!!!!!!!");  
                             },
                             0x56 => {
                                 let data = FlightData::from(&gram.payload());
@@ -250,10 +410,51 @@ fn main() {
                         */
                     }
                 },
-                Err(e) => println!("receive failed: {:?}", e),
+                Err(e) => (),
+            }
+        }
+    }
+}
+
+fn main() {
+    gst::init().expect("Failed to init gstreamer");
+
+    let is_running = Arc::new(AtomicBool::new(true));
+
+    let (controller_events_sender, controller_events_receiver) = channel();
+
+    let mut controller = controller::Controller::get_controller(0).unwrap();
+    controller.set_event_listener(controller_events_sender);
+    let controller_state = controller.get_state();
+    let controller_is_running = is_running.clone();
+    let controller_thread = thread::spawn(move || {
+        controller.start(controller_is_running);
+    });
+
+    let tello = Tello::connect(VIDEO_PORT).unwrap();
+
+    let tello_cmd_loop = thread::spawn(move || {
+        loop {
+            if let Ok(event) = controller_events_receiver.recv_timeout(Duration::from_millis(10)) {
+                match event {
+                    controller::Event::XPress => tello.takeoff(),
+                    controller::Event::CirclePress =>tello.land(),
+                    _ => ()
+                }
+            } else {
+                tello.set_joystick(*controller_state.lock().unwrap());
             }
         }
     });
+
+    tello_cmd_loop.join().unwrap();
+    controller_thread.join().unwrap();
+    
+
+    /*
+    let is_running = Arc::new(AtomicBool::new(true));
+
+    let video_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], VIDEO_PORT))).expect("Failed to create video socket");
 
     let pipeline = gst::Pipeline::new(None);
     let source = gst::ElementFactory::make("appsrc", None).expect("Failed to create appsource");
@@ -349,4 +550,5 @@ fn main() {
     video_listen_thread.join().expect("Failed to join video listener thread");
     video_processor_thread.join().expect("Failed to join video processor thread");
     cmd_listen_thread.join().expect("Failed to join cmd thread");
+    */
 }

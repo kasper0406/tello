@@ -17,10 +17,10 @@ use evdev::enums::{ EventCode, EV_KEY, EV_ABS };
 
 #[derive(Clone, Copy, Debug)]
 pub struct State {
-    joystick_left_x: f32,
-    joystick_left_y: f32,
-    joystick_right_x: f32,
-    joystick_right_y: f32
+    pub joystick_left_x: f32,
+    pub joystick_left_y: f32,
+    pub joystick_right_x: f32,
+    pub joystick_right_y: f32
 }
 
 impl State {
@@ -57,7 +57,11 @@ unsafe impl Send for Controller {}
 unsafe impl Sync for Controller {}
 
 fn normalize(value: i32) -> f32 {
-    return ((value as f32) - 127f32) / 1.28;
+    let normalized = ((value as f32) - 127f32) / 128f32;
+    if normalized.abs() < 0.02 {
+        return 0.0;
+    }
+    normalized
 }
 
 impl Controller {
@@ -91,7 +95,7 @@ impl Controller {
         controllers
     }
 
-    fn get_controller(index: usize) -> Option<Controller> {
+    pub fn get_controller(index: usize) -> Option<Controller> {
         let mut paths = Self::list_controller_paths();
 
         if index >= paths.len() {
@@ -111,15 +115,15 @@ impl Controller {
         }
     }
 
-    fn set_event_listener(&mut self, event_channel: Sender<Event>) {
+    pub fn set_event_listener(&mut self, event_channel: Sender<Event>) {
         self.event_channel = Some(event_channel);
     }
 
-    fn get_state(&self) -> Arc<Mutex<State>> {
+    pub fn get_state(&self) -> Arc<Mutex<State>> {
         self.state.clone()
     }
 
-    fn start(&mut self, running: Arc<AtomicBool>) {
+    pub fn start(&mut self, running: Arc<AtomicBool>) {
         let mut timeout = TimeVal::milliseconds(100);
         let mut fdset = FdSet::new();
         fdset.insert(self.device.fd().unwrap().into_raw_fd());
