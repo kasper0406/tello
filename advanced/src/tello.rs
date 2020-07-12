@@ -60,17 +60,31 @@ enum TelloGramDirection {
 }
 
 #[derive(Debug)]
+enum FlipDirection {
+    Forward,
+    Left,
+    Backward,
+    Right,
+    ForwardLeft,
+    BackwardLeft,
+    BackwardRight,
+    ForwardRight
+}
+
+#[derive(Debug)]
 enum Commands {
     VideoSPSPPS,
     Takeoff,
     Land,
     Joystick { lx: f32, ly: f32, rx: f32, ry: f32 },
+    Flip(FlipDirection)
 }
 
 enum PackageType {
     Get,
     Set,
-    Data2
+    Data2,
+    Flip
 }
 
 impl PackageType {
@@ -79,6 +93,7 @@ impl PackageType {
             Get => 1,
             Data2 => 4,
             Set => 5,
+            Flip => 6
         }
     }
 }
@@ -210,7 +225,10 @@ impl TelloGram {
                 payload[10] = (ms >> 8) as u8;
 
                 TelloGram::construct_package(PackageType::Data2, 0x50, 0, &payload)
-            }
+            },
+            Commands::Flip(direction) => {
+                TelloGram::construct_package(PackageType::Flip, 0x5c, seq, &[direction as u8])
+            },
         }
     }
 }
@@ -358,6 +376,13 @@ impl Tello {
         ));
     }
 
+    fn flip(&self, direction: FlipDirection) {
+        self.send_raw(&TelloGram::from(
+            Commands::Flip(direction),
+            self.seq_nr.fetch_add(1, Ordering::SeqCst)
+        ));
+    }
+
     fn set_joystick(&self, controller: controller::State) {
         self.send_raw(&TelloGram::from(
             Commands::Joystick {
@@ -493,7 +518,7 @@ impl Tello {
                     Commands::VideoSPSPPS,
                     sequence_number.fetch_add(1, Ordering::SeqCst)
                 )).expect("Failed to send video request");
-                thread::sleep(time::Duration::from_millis(2000));
+                thread::sleep(time::Duration::from_millis(1000));
             }
         }));
     }
@@ -556,10 +581,14 @@ fn main() {
     let tello_cmd_loop_running = is_running.clone();
     let tello_cmd_loop = thread::spawn(move || {
         while (*tello_cmd_loop_running).load(Ordering::Relaxed) {
-            if let Ok(event) = controller_events_receiver.recv_timeout(Duration::from_millis(10)) {
+            if let Ok(event) = controller_events_receiver.recv_timeout(Duration::from_millis(15)) {
                 match event {
                     controller::Event::XPress => tello.takeoff(),
-                    controller::Event::CirclePress =>tello.land(),
+                    controller::Event::CirclePress => tello.land(),
+                    controller::Event::LeftHat => tello.flip(FlipDirection::Left),
+                    controller::Event::UpHat => tello.flip(FlipDirection::Forward),
+                    controller::Event::RightHat => tello.flip(FlipDirection::Right),
+                    controller::Event::DownHat => tello.flip(FlipDirection::Backward),
                     _ => ()
                 }
             } else {
